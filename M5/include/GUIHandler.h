@@ -42,6 +42,7 @@ public:
 
     void setJumpStopped(bool val)       { _jump_stopped   = val; }
     void setJumpDetectEnabled(bool val) { _jump_detect_on = val; }
+    void setJumpChannel(int8_t ch, float diff) { _jump_ch = ch; _jump_diff = diff; }
 
     // Returns command from user interaction
     GUICommand tick(const SensorSnapshot& snapshot, AppMode current_mode);
@@ -53,6 +54,8 @@ private:
     uint16_t _pending_mask   = 0;
     bool     _jump_stopped   = false;
     bool     _jump_detect_on = true;
+    int8_t   _jump_ch        = -1;
+    float    _jump_diff      = 0.0f;
 
     void       drawBars(const SensorSnapshot& snapshot);
     void       drawButtons(bool any_selected, AppMode current_mode);

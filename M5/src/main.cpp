@@ -73,6 +73,8 @@ bool encoder_found = false;
 void requestStreamStart() {
     g_state.reset_jump_state = true;
     g_state.jump_detected    = false;
+    g_state.jump_ch          = -1;
+    g_state.jump_diff        = 0.0f;
     g_state.mode             = AppMode::STREAM;
 }
 
@@ -201,6 +203,12 @@ void acquisitionTask(void* pvParameters) {
                             if (++jump_count[i] >= JUMP_CONFIRM_FRAMES) {
                                 g_state.jump_detected = true;
                                 g_state.mode = AppMode::STANDBY;
+                                // Display only: keep the first channel to trip,
+                                // since that is the one worth investigating.
+                                if (g_state.jump_ch.load() < 0) {
+                                    g_state.jump_ch   = (int8_t)i;
+                                    g_state.jump_diff = diff;
+                                }
                             } else {
                                 snapshot.sensors[i].angle = last_good_angle[i];
                             }
@@ -279,10 +287,25 @@ void guiTask(void* pvParameters) {
                     M5.Display.setTextDatum(middle_center);
                     M5.Display.setFont(&fonts::Font4);
                     M5.Display.setTextColor(TFT_RED);
-                    M5.Display.drawCentreString("Jump Detected", 160, 95);
+                    M5.Display.drawCentreString("Jump Detected", 160, 80);
+
+                    // Which joint, and how far it moved. "Which one" is the
+                    // first thing needed to decide whether this is a bad zero,
+                    // a cable, or something mechanical.
+                    char line[48];
+                    const int8_t jch = g_state.jump_ch.load();
+                    M5.Display.setTextColor(TFT_YELLOW);
+                    if (jch >= 0) {
+                        snprintf(line, sizeof(line), "CH%d    %+.1f deg",
+                                 jch + 1, g_state.jump_diff.load());
+                    } else {
+                        snprintf(line, sizeof(line), "channel unknown");
+                    }
+                    M5.Display.drawCentreString(line, 160, 120);
+
                     M5.Display.setFont(&fonts::Font2);
                     M5.Display.setTextColor(TFT_WHITE);
-                    M5.Display.drawCentreString("Recalibrate zero position", 160, 135);
+                    M5.Display.drawCentreString("Recalibrate zero position", 160, 160);
                     vTaskDelay(pdMS_TO_TICKS(3000));
                 }
                 M5.Display.fillScreen(BLACK);
@@ -295,6 +318,7 @@ void guiTask(void* pvParameters) {
             xQueuePeek(guiQueue, &snapshot, 0);
             gui.setJumpStopped(g_state.jump_detected);
             gui.setJumpDetectEnabled(g_state.jump_detect_enabled);
+            gui.setJumpChannel(g_state.jump_ch, g_state.jump_diff);
             GUICommand cmd = gui.tick(snapshot, AppMode::STANDBY);
 
             switch (cmd.type) {

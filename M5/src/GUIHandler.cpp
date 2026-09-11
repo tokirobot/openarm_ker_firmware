@@ -119,7 +119,16 @@ void GUIHandler::drawButtons(bool any_selected, AppMode current_mode) {
         uint16_t dark_red = _canvas->color565(80, 0, 0);
         _canvas->fillRect(0, 20, 320, 18, dark_red);
         _canvas->setTextColor(TFT_RED, dark_red);
-        _canvas->drawString("STREAMING STOPPED: Jump Detected", 160, 29);
+        // The status bar persists until START, so it is where the operator
+        // looks after the overlay has gone; name the axis here too.
+        char msg[64];
+        if (_jump_ch >= 0) {
+            snprintf(msg, sizeof(msg), "JUMP STOP: CH%d (%+.1f deg)",
+                     _jump_ch + 1, _jump_diff);
+        } else {
+            snprintf(msg, sizeof(msg), "STREAMING STOPPED: Jump Detected");
+        }
+        _canvas->drawString(msg, 160, 29);
     } else {
         _canvas->fillRect(0, 20, 320, 18, BLACK);
         _canvas->setTextColor(TFT_WHITE, BLACK);
