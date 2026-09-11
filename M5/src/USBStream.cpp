@@ -15,6 +15,48 @@
 // src/USBStream.cpp
 #include "USBStream.h"
 
+// tud_vendor_write_flush() is not exposed through Arduino's USBVendor wrapper
+// (whose flush() is an empty function), so reach for the TinyUSB API directly.
+#include "tusb.h"
+
+// Push whatever is in the TX FIFO onto the wire now, rather than waiting for it
+// to reach a full endpoint packet.
+static inline void usbFlushTx() { tud_vendor_write_flush(); }
+
+// ---------------------------------------------------------------------------
+// Waiting for TX FIFO space, without busy-waiting.
+//
+// The FIFO holds one 64-byte packet, so any frame bigger than that waits for
+// the first transfer to complete before the rest can be queued. Polling that
+// with delayMicroseconds() burns roughly a millisecond of CPU per frame.
+//
+// tud_vendor_tx_cb() fires when a vendor IN transfer completes - precisely when
+// space frees up. TinyUSB declares it TU_ATTR_WEAK and the Arduino core leaves
+// it unimplemented, so we can own it and turn the wait into a sleep.
+//
+// The one-tick timeout on the wait, not the callback, is what guarantees
+// progress: if the notification never arrives the loop simply retries, so
+// nothing depends on the callback firing or on which context it runs in.
+// ---------------------------------------------------------------------------
+static volatile TaskHandle_t s_tx_waiter = nullptr;
+
+extern "C" void tud_vendor_tx_cb(uint8_t itf, uint32_t sent_bytes) {
+    (void)itf;
+    (void)sent_bytes;
+    TaskHandle_t waiter = s_tx_waiter;
+    if (waiter == nullptr) return;
+
+    if (xPortInIsrContext()) {
+        BaseType_t higher_prio_woken = pdFALSE;
+        vTaskNotifyGiveFromISR(waiter, &higher_prio_woken);
+        if (higher_prio_woken) portYIELD_FROM_ISR();
+    } else {
+        xTaskNotifyGive(waiter);
+    }
+}
+
+static inline void usbWaitTxSpace() { ulTaskNotifyTake(pdTRUE, 1); }
+
 USBStream::USBStream()
     : _error(false)
     , _on_command(nullptr)
@@ -128,28 +170,51 @@ uint8_t USBStream::_checksum() const {
 }
 
 bool USBStream::send() {
-    if (_error || !mounted()) return false;
+    if (_error || !mounted()) {
+        _dropped_frames++;
+        return false;
+    }
 
     uint8_t out[MAX_BUF + 3];
-    out[0] = 0xA5;
-    out[1] = 0x5A;
+    out[0] = PACKET_HEADER_0;
+    out[1] = PACKET_HEADER_1;
     memcpy(out + 2, _bin_buf, _bin_total);
     out[_bin_total + 2] = _checksum();
-    size_t total = _bin_total + 3;
+    const size_t total = _bin_total + 3;
 
-    size_t sent = 0;
-    uint32_t t_start = millis();
+    size_t   sent    = 0;
+    bool     stalled = false;
+    const uint32_t t_start = millis();
+
+    // Register before the first write so a completion cannot be missed.
+    s_tx_waiter = xTaskGetCurrentTaskHandle();
+
     while (sent < total) {
-        size_t chunk = min((size_t)64, total - sent);
-        size_t ret   = _vendor.write(out + sent, chunk);
+        const size_t ret = _vendor.write(out + sent, min(USB_PACKET, total - sent));
         if (ret > 0) {
-            sent    += ret;
-            t_start  = millis();
-        } else {
-            if (millis() - t_start > 10) return false;
-            delay(1);
+            sent += ret;
+            // Flush every accepted chunk. The FIFO is one packet deep, so a
+            // trailing partial packet would otherwise wait for the next frame
+            // to push it out - and would never leave at all once streaming
+            // stops, truncating the last frame the PC ever sees.
+            usbFlushTx();
+            continue;
         }
+
+        stalled = true;
+        if (millis() - t_start >= SEND_TIMEOUT_MS) {
+            _stall_events++;
+            _dropped_frames++;
+            usbFlushTx();
+            s_tx_waiter = nullptr;
+            return false;
+        }
+        usbWaitTxSpace();
     }
+
+    s_tx_waiter = nullptr;
+    if (stalled) _stall_events++;
+    _sent_frames++;
     return true;
 }
 
@@ -168,7 +233,14 @@ void USBStream::sendPingResponse(const SensorSnapshot& snapshot,
                                  const char* updated) {
     if (!mounted()) return;
 
-    static uint8_t buf[256];
+    // Layout is 2 + 16 + 16 + 12 + 1 + 18*fields + 5*NUM_SENSORS bytes, i.e.
+    // 127 + 18*fields. The old 256-byte buffer overflowed at 8 fields with no
+    // bounds check, so registering a few more stream fields would have
+    // corrupted memory. Size it for the schema limit and check the fit.
+    static uint8_t buf[64 + 18 * MAX_FIELDS + 5 * NUM_SENSORS];
+    const size_t need = 47 + 18 * _field_count + 5 * NUM_SENSORS;
+    if (need > sizeof(buf)) return;
+
     memset(buf, 0, sizeof(buf));
     size_t pos = 0;
 
@@ -194,16 +266,20 @@ void USBStream::sendPingResponse(const SensorSnapshot& snapshot,
     size_t sent = 0;
     uint32_t t_start = millis();
     while (sent < pos) {
-        size_t chunk = min((size_t)64, pos - sent);
+        size_t chunk = min(USB_PACKET, pos - sent);
         size_t ret = _vendor.write(buf + sent, chunk);
         if (ret > 0) {
             sent    += ret;
             t_start  = millis();
+            usbFlushTx();
         } else {
             if (millis() - t_start > 100) break;
             delay(1);
         }
     }
+    // The PC blocks on this reply during the handshake, so its tail must not be
+    // left sitting in the FIFO.
+    usbFlushTx();
 }
 
 // Utilities

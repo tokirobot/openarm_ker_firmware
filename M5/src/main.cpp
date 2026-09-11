@@ -62,6 +62,24 @@ bool encoder_found = false;
 
 
 
+// =====================================================
+// Stream control
+//
+// Starting the stream must clear the latch that stopped it, otherwise the very
+// next acquisition frame re-triggers the same fault and drops straight back to
+// STANDBY - which from the PC looks exactly like the start command being
+// ignored. Both entry points go through here so they cannot drift apart.
+// =====================================================
+void requestStreamStart() {
+    g_state.reset_jump_state = true;
+    g_state.jump_detected    = false;
+    g_state.mode             = AppMode::STREAM;
+}
+
+void requestStreamStop() {
+    g_state.mode = AppMode::STANDBY;
+}
+
 void drawStopScreen() {
     M5.Display.fillScreen(BLACK);
     M5.Display.fillRoundRect(STOP_BTN_X, STOP_BTN_Y, STOP_BTN_W, STOP_BTN_H, 8, TFT_RED);
@@ -281,9 +299,7 @@ void guiTask(void* pvParameters) {
 
             switch (cmd.type) {
                 case GUICommand::Type::START:
-                    g_state.reset_jump_state = true;
-                    g_state.jump_detected = false;
-                    g_state.mode = AppMode::STREAM;
+                    requestStreamStart();
                     break;
                 case GUICommand::Type::TOGGLE_JUMP_DETECT:
                     g_state.jump_detect_enabled = !g_state.jump_detect_enabled.load();
@@ -304,13 +320,16 @@ void guiTask(void* pvParameters) {
             if (tp.wasReleased()) {
                 if (tp.x >= STOP_BTN_X && tp.x <= STOP_BTN_X + STOP_BTN_W &&
                     tp.y >= STOP_BTN_Y && tp.y <= STOP_BTN_Y + STOP_BTN_H) {
-                    g_state.mode = AppMode::STANDBY;
+                    requestStreamStop();
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(50));
         }
     }
 }
+
+// Defined below, after setup(), so it can sit next to loop() it replaced.
+void streamTask(void* pvParameters);
 
 // =====================================================
 // Setup
@@ -337,20 +356,32 @@ void setup() {
     }
 
     // USB Stream schema
+    // The PC reads this schema from the PING response and builds its unpack
+    // format from it, so adding or retyping a field needs no PC-side change.
     stream.add("timestamp",      Type::UINT32);
     stream.add("angles",         Type::FLOAT, NUM_SENSORS);
-    stream.add("errors",         Type::BOOL,  NUM_SENSORS);
+    // One bit per channel instead of one byte: sixteen booleans cost sixteen
+    // bytes on every frame to carry sixteen bits. Renamed rather than retyped
+    // in place so a reader expecting the old list fails loudly instead of
+    // silently treating an integer as one.
+    stream.add("error_mask",     Type::UINT16);
+    // Frame counter. Nothing else lets the PC tell "the M5 sent nothing" apart
+    // from "the frame was lost on the way", which is the first thing to ask
+    // whenever the stream looks out of sync.
+    stream.add("seq",            Type::UINT32);
     // stream.add("encoder_value",  Type::INT16);  // unused
     // stream.add("encoder_button", Type::UINT8);  // unused
 
     stream.onCommand([](const uint8_t* buf, size_t len) -> bool {
+        if (len == 0) return false;
         switch (buf[0]) {
-            case 0x00:  // PING
-                g_state.mode = AppMode::STANDBY;
+            case 0x00:  // PING - a metadata query, which must not change the
+                        // mode: the PC pings repeatedly while fetching the
+                        // schema, so a health check would kill a live session.
                 g_state.ping_requested = true;
                 return true;
-            case 0x01: g_state.mode     = AppMode::STANDBY; return true;
-            case 0x02: g_state.mode     = AppMode::STREAM;  return true;
+            case 0x01: requestStreamStop();  return true;
+            case 0x02: requestStreamStart(); return true;
             case 0x03: g_state.zero_all = true;             return true;
             case 0x04:
                 if (len >= 3)
@@ -378,43 +409,69 @@ void setup() {
     // Tasks
     xTaskCreatePinnedToCore(acquisitionTask, "Acquisition", 8192, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(sensorTask,      "Sensor",      4096, NULL, 2, NULL, 0);
+    // Above guiTask: a full-screen canvas push holds the SPI bus for ~31 ms and
+    // must not be able to hold up a stream frame.
+    xTaskCreatePinnedToCore(streamTask,      "Stream",      4096, NULL, 4, NULL, 1);
     xTaskCreatePinnedToCore(guiTask,         "GUI",         4096, NULL, 1, NULL, 1);
 }
 
 // =====================================================
-// Loop (Core 1) - USB command handling & stream.send()
+// Core 1: Stream task
+//
+// This used to be loop(). Arduino's loopTask runs on core 1 at priority 1 -
+// exactly where guiTask runs - and a full-screen M5Canvas push is
+// 320*240*16 bit = 153600 bytes over a 40 MHz SPI bus, about 31 ms during which
+// an equal-priority task gets no CPU. Streaming from loop() therefore stalled
+// for most of every GUI frame.
+//
+// Priority 4 sits below acquisitionTask (5, and on core 0 anyway) and below the
+// TinyUSB device task, but above guiTask and loopTask, so rendering can no
+// longer delay a frame. It also blocks on the queue instead of polling, so a
+// frame goes out as soon as acquisitionTask produces one.
 // =====================================================
-void loop() {
+void streamTask(void* pvParameters) {
     static SensorSnapshot snapshot;
     uint8_t               cmd_buf[64];
+    uint32_t              tx_seq = 0;
 
-    stream.recv(cmd_buf, sizeof(cmd_buf));
+    for (;;) {
+        stream.recv(cmd_buf, sizeof(cmd_buf));
 
-    if (g_state.ping_requested) {
-        g_state.ping_requested = false;
-        xQueuePeek(dataQueue, &snapshot, 0);
-        stream.sendPingResponse(snapshot, FW_VERSION, HW_VERSION, LAST_UPDATED);
-    }
-
-    if (g_state.mode == AppMode::STANDBY) {
-        vTaskDelay(pdMS_TO_TICKS(10));
-    } else {
-        if (xQueueReceive(dataQueue, &snapshot, 0) == pdTRUE) {
-            float angles[NUM_SENSORS];
-            bool  errors[NUM_SENSORS];
-            for (int i = 0; i < NUM_SENSORS; i++) {
-                angles[i] = snapshot.sensors[i].angle;
-                errors[i] = snapshot.sensors[i].error;
-            }
-
-            stream.set("timestamp",      snapshot.timestamp);
-            stream.set("angles",         angles,             NUM_SENSORS);
-            stream.set("errors",         errors,             NUM_SENSORS);
-            // stream.set("encoder_value",  snapshot.encoder_value);   // unused
-            // stream.set("encoder_button", snapshot.encoder_button);  // unused
-            stream.send();
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(1));
+        if (g_state.ping_requested.exchange(false)) {
+            xQueuePeek(dataQueue, &snapshot, 0);
+            stream.sendPingResponse(snapshot, FW_VERSION, HW_VERSION, LAST_UPDATED);
         }
+
+        if (g_state.mode == AppMode::STANDBY) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        if (xQueueReceive(dataQueue, &snapshot, pdMS_TO_TICKS(2)) != pdTRUE) {
+            continue;
+        }
+
+        float    angles[NUM_SENSORS];
+        uint16_t error_mask = 0;
+        for (int i = 0; i < NUM_SENSORS; i++) {
+            angles[i] = snapshot.sensors[i].angle;
+            if (snapshot.sensors[i].error) error_mask |= (uint16_t)(1u << i);
+        }
+
+        stream.set("timestamp",  snapshot.timestamp);
+        stream.set("angles",     angles, NUM_SENSORS);
+        stream.set("error_mask", error_mask);
+        stream.set("seq",        tx_seq++);
+        stream.send();
     }
+}
+
+// =====================================================
+// Loop (Core 1)
+//
+// Streaming moved to streamTask so GUI rendering cannot delay it; nothing is
+// left to do here.
+// =====================================================
+void loop() {
+    vTaskDelay(pdMS_TO_TICKS(100));
 }
