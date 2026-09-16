@@ -165,8 +165,9 @@ struct SystemState {
     std::atomic<uint16_t> zero_mask      { 0 };
     std::atomic<bool>     ping_requested { false };
     std::atomic<bool>     jump_detected       { false };
-    // Which channel tripped jump detection, and by how much. Recorded purely
-    // for display: nothing reads these to make a decision.
+    // Which channel tripped jump detection first, and by how much. Only the
+    // first trip is kept (acquisitionTask leaves them alone once set); the GUI
+    // displays them and requestStreamStart() clears them.
     std::atomic<int8_t>   jump_ch             { -1 };
     std::atomic<float>    jump_diff           { 0.0f };
     std::atomic<bool>     jump_detect_enabled { true };

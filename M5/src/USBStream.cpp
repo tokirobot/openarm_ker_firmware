@@ -203,6 +203,11 @@ bool USBStream::send() {
 
         stalled = true;
         if (millis() - t_start >= SEND_TIMEOUT_MS) {
+            // Give up on this frame. Chunks already accepted stay in the FIFO
+            // and reach the host once it reads again, so the host sees one
+            // truncated frame; its header sync + checksum reject it and the
+            // gap shows up in "seq". Flushing here is what lets the FIFO drain
+            // instead of holding the partial frame until the next send().
             _stall_events++;
             _dropped_frames++;
             usbFlushTx();
