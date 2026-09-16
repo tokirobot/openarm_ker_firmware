@@ -15,7 +15,7 @@
 // include/Meta.h
 #pragma once
 
-#define FW_VERSION   "2.0.1"
+#define FW_VERSION   "2.1.0"
 #define HW_VERSION   "2.0.0"
 #define LAST_UPDATED "2026-09-15"
 #define USB_VID 0x303A
